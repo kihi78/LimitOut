@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">LimitOut</string>
+    <string name="accessibility_description">LimitOut: アプリの使用時間を監視して制限します。</string>
 </resources>

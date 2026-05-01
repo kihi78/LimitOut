@@ -55,4 +55,5 @@ dependencies {
     androidTestImplementation(libs.androidx.junit)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     debugImplementation(libs.androidx.compose.ui.tooling)
+    implementation("com.google.accompanist:accompanist-drawablepainter:0.35.0-alpha")
 }
