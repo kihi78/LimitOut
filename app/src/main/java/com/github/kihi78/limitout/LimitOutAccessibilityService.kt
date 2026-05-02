@@ -14,7 +14,9 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
+import com.github.kihi78.limitout.R
 
 class LimitOutAccessibilityService : AccessibilityService() {
 
@@ -100,11 +102,7 @@ class LimitOutAccessibilityService : AccessibilityService() {
             addAction("ACTION_LIMITOUT_SNOOZE")
             addAction("ACTION_LIMITOUT_NOTIF_DISMISSED")
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(actionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(actionReceiver, filter)
-        }
+        ContextCompat.registerReceiver(this, actionReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
         if (sharedPrefs.getBoolean("is_enabled", false) && sharedPrefs.getBoolean("show_notification", true)) {
             showNotification()
@@ -227,7 +225,7 @@ class LimitOutAccessibilityService : AccessibilityService() {
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("LimitOut 監視中")
             .setContentText("設定されたアプリの連続使用を監視しています")
-            .setSmallIcon(android.R.drawable.ic_secure)
+            .setSmallIcon(com.github.kihi78.limitout.R.drawable.ic_notification)
             .setOngoing(true)
             .addAction(android.R.drawable.ic_media_pause, "${snoozeMinutes}分間停止", snoozePendingIntent)
             .setDeleteIntent(dismissPendingIntent)
