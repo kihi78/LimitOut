@@ -11,6 +11,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -19,6 +27,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.material3.CardDefaults
@@ -91,7 +100,6 @@ fun LimitOutApp() {
     var targetApps by remember { mutableStateOf(TargetAppsStore.load(sharedPrefs)) }
     var selectedApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
 
-    var defaultLimitTime by remember { mutableStateOf(TargetAppsStore.defaultLimitMinutes(sharedPrefs)) }
     var snoozeTime by remember { mutableStateOf(sharedPrefs.getString("snooze_time", "10") ?: "10") }
 
     var showAppSelector by remember { mutableStateOf(false) }
@@ -148,47 +156,56 @@ fun LimitOutApp() {
         )
     }
 
-    if (showAppSelector) {
-        AppSelectionScreen(
-            apps = installedApps,
-            selectedPackages = targetApps.keys,
-            onAppToggled = { app, checked ->
-                if (checked) {
-                    saveTargetApps(targetApps + (app.packageName to defaultLimitTime))
-                } else {
-                    saveTargetApps(targetApps - app.packageName)
-                }
-            },
-            onBack = { showAppSelector = false }
-        )
-    } else {
-        MainSettingsScreen(
-            isEnabled = isEnabled,
-            onEnabledChange = {
-                isEnabled = it
-                sharedPrefs.edit().putBoolean("is_enabled", it).apply()
-            },
-            isShowNotification = isShowNotification,
-            onNotificationChange = {
-                isShowNotification = it
-                sharedPrefs.edit().putBoolean("show_notification", it).apply()
-            },
-            selectedApps = selectedApps,
-            targetApps = targetApps,
-            onSelectAppClick = { showAppSelector = true },
-            onEditLimitClick = { editingPackage = it },
-            onRemoveApp = { saveTargetApps(targetApps - it) },
-            defaultLimitTime = defaultLimitTime,
-            onDefaultLimitTimeChange = {
-                defaultLimitTime = it
-                sharedPrefs.edit().putInt("limit_time", it).apply()
-            },
-            snoozeTime = snoozeTime,
-            onSnoozeTimeChange = {
-                snoozeTime = it
-                sharedPrefs.edit().putString("snooze_time", it).apply()
+    AnimatedContent(
+        targetState = showAppSelector,
+        transitionSpec = {
+            if (targetState) {
+                (slideInHorizontally(tween(250)) { width -> width } + fadeIn(tween(250))) togetherWith
+                    (slideOutHorizontally(tween(250)) { width -> -width / 4 } + fadeOut(tween(150)))
+            } else {
+                (slideInHorizontally(tween(250)) { width -> -width / 4 } + fadeIn(tween(250))) togetherWith
+                    (slideOutHorizontally(tween(250)) { width -> width } + fadeOut(tween(150)))
             }
-        )
+        },
+        label = "screen_transition"
+    ) { isSelectorVisible ->
+        if (isSelectorVisible) {
+            AppSelectionScreen(
+                apps = installedApps,
+                initiallySelectedPackages = targetApps.keys,
+                onConfirm = { newSelection ->
+                    val updated = newSelection.associateWith { pkg ->
+                        targetApps[pkg] ?: TargetAppsStore.DEFAULT_LIMIT_MINUTES
+                    }
+                    saveTargetApps(updated)
+                    showAppSelector = false
+                },
+                onBack = { showAppSelector = false }
+            )
+        } else {
+            MainSettingsScreen(
+                isEnabled = isEnabled,
+                onEnabledChange = {
+                    isEnabled = it
+                    sharedPrefs.edit().putBoolean("is_enabled", it).apply()
+                },
+                isShowNotification = isShowNotification,
+                onNotificationChange = {
+                    isShowNotification = it
+                    sharedPrefs.edit().putBoolean("show_notification", it).apply()
+                },
+                selectedApps = selectedApps,
+                targetApps = targetApps,
+                onSelectAppClick = { showAppSelector = true },
+                onEditLimitClick = { editingPackage = it },
+                onRemoveApp = { saveTargetApps(targetApps - it) },
+                snoozeTime = snoozeTime,
+                onSnoozeTimeChange = {
+                    snoozeTime = it
+                    sharedPrefs.edit().putString("snooze_time", it).apply()
+                }
+            )
+        }
     }
 }
 
@@ -204,8 +221,6 @@ fun MainSettingsScreen(
     onSelectAppClick: () -> Unit,
     onEditLimitClick: (String) -> Unit,
     onRemoveApp: (String) -> Unit,
-    defaultLimitTime: Int,
-    onDefaultLimitTimeChange: (Int) -> Unit,
     snoozeTime: String,
     onSnoozeTimeChange: (String) -> Unit
 ) {
@@ -264,21 +279,23 @@ fun MainSettingsScreen(
             // カード2: ターゲットアプリ（複数選択・アプリごとの制限時間）
             item {
                 SettingCard(title = "制限対象", icon = Icons.Default.Smartphone) {
-                    if (selectedApps.isEmpty()) {
-                        Text(
-                            "制限するアプリが選択されていません",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    } else {
-                        selectedApps.forEach { app ->
-                            TargetAppRow(
-                                app = app,
-                                limitMinutes = targetApps[app.packageName]
-                                    ?: TargetAppsStore.DEFAULT_LIMIT_MINUTES,
-                                onEditLimitClick = { onEditLimitClick(app.packageName) },
-                                onRemoveClick = { onRemoveApp(app.packageName) }
+                    Column(modifier = Modifier.animateContentSize()) {
+                        if (selectedApps.isEmpty()) {
+                            Text(
+                                "制限するアプリが選択されていません",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                        } else {
+                            selectedApps.forEach { app ->
+                                TargetAppRow(
+                                    app = app,
+                                    limitMinutes = targetApps[app.packageName]
+                                        ?: TargetAppsStore.DEFAULT_LIMIT_MINUTES,
+                                    onEditLimitClick = { onEditLimitClick(app.packageName) },
+                                    onRemoveClick = { onRemoveApp(app.packageName) }
+                                )
+                            }
                         }
                     }
 
@@ -294,25 +311,6 @@ fun MainSettingsScreen(
             // カード3: タイマー設定
             item {
                 SettingCard(title = "時間設定", icon = Icons.Default.Timer) {
-                    Text(
-                        "デフォルトの制限時間",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = LimitOutPrimary
-                    )
-                    Text(
-                        "アプリを新しく追加したときに適用されます",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    MinutePicker(
-                        selectedMinutes = defaultLimitTime,
-                        onMinutesChange = onDefaultLimitTimeChange
-                    )
-
-                    Spacer(modifier = Modifier.height(24.dp))
-
                     Text("一定時間停止 (スヌーズ)", style = MaterialTheme.typography.labelLarge, color = LimitOutPrimary)
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedTextField(
@@ -459,17 +457,25 @@ fun SettingCard(
 @Composable
 fun AppSelectionScreen(
     apps: List<AppInfo>,
-    selectedPackages: Set<String>,
-    onAppToggled: (AppInfo, Boolean) -> Unit,
+    initiallySelectedPackages: Set<String>,
+    onConfirm: (Set<String>) -> Unit,
     onBack: () -> Unit
 ) {
+    // 「追加」を押すまでは確定させないためのステージング用の選択状態
+    var stagedSelection by remember { mutableStateOf(initiallySelectedPackages) }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("アプリを選択 (${selectedPackages.size})") },
+                title = { Text("アプリを選択 (${stagedSelection.size})") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "戻る")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "戻る")
+                    }
+                },
+                actions = {
+                    TextButton(onClick = { onConfirm(stagedSelection) }) {
+                        Text("追加", color = LimitOutPrimary, fontWeight = FontWeight.Bold)
                     }
                 }
             )
@@ -482,17 +488,29 @@ fun AppSelectionScreen(
         } else {
             LazyColumn(modifier = Modifier.padding(padding).fillMaxSize()) {
                 items(apps, key = { it.packageName }) { app ->
-                    val isSelected = selectedPackages.contains(app.packageName)
+                    val isSelected = stagedSelection.contains(app.packageName)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onAppToggled(app, !isSelected) }
+                            .clickable {
+                                stagedSelection = if (isSelected) {
+                                    stagedSelection - app.packageName
+                                } else {
+                                    stagedSelection + app.packageName
+                                }
+                            }
                             .padding(horizontal = 16.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Checkbox(
                             checked = isSelected,
-                            onCheckedChange = { onAppToggled(app, it) },
+                            onCheckedChange = {
+                                stagedSelection = if (it) {
+                                    stagedSelection + app.packageName
+                                } else {
+                                    stagedSelection - app.packageName
+                                }
+                            },
                             colors = CheckboxDefaults.colors(checkedColor = LimitOutPrimary)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
