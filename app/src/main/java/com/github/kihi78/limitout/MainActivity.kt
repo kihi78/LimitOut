@@ -36,6 +36,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -96,7 +97,7 @@ fun LimitOutApp() {
     var isEnabled by remember { mutableStateOf(sharedPrefs.getBoolean("is_enabled", false)) }
     var isShowNotification by remember { mutableStateOf(sharedPrefs.getBoolean("show_notification", true)) }
 
-    // 制限対象アプリ（パッケージ名 → 制限時間[分]）
+    // 制限対象アプリ（パッケージ名 → 制限時間[分]・有効/無効）
     var targetApps by remember { mutableStateOf(TargetAppsStore.load(sharedPrefs)) }
     var selectedApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
 
@@ -106,7 +107,7 @@ fun LimitOutApp() {
     var installedApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
     var editingPackage by remember { mutableStateOf<String?>(null) }
 
-    val saveTargetApps: (Map<String, Int>) -> Unit = { updated ->
+    val saveTargetApps: (Map<String, TargetAppConfig>) -> Unit = { updated ->
         targetApps = updated
         TargetAppsStore.save(sharedPrefs, updated)
     }
@@ -145,11 +146,13 @@ fun LimitOutApp() {
 
     editingPackage?.let { packageName ->
         val appName = selectedApps.find { it.packageName == packageName }?.appName ?: packageName
+        val currentConfig = targetApps[packageName]
+            ?: TargetAppConfig(TargetAppsStore.DEFAULT_LIMIT_MINUTES)
         LimitTimeDialog(
             appName = appName,
-            currentMinutes = targetApps[packageName] ?: TargetAppsStore.DEFAULT_LIMIT_MINUTES,
+            currentMinutes = currentConfig.limitMinutes,
             onConfirm = { minutes ->
-                saveTargetApps(targetApps + (packageName to minutes))
+                saveTargetApps(targetApps + (packageName to currentConfig.copy(limitMinutes = minutes)))
                 editingPackage = null
             },
             onDismiss = { editingPackage = null }
@@ -175,7 +178,7 @@ fun LimitOutApp() {
                 initiallySelectedPackages = targetApps.keys,
                 onConfirm = { newSelection ->
                     val updated = newSelection.associateWith { pkg ->
-                        targetApps[pkg] ?: TargetAppsStore.DEFAULT_LIMIT_MINUTES
+                        targetApps[pkg] ?: TargetAppConfig(TargetAppsStore.DEFAULT_LIMIT_MINUTES)
                     }
                     saveTargetApps(updated)
                     showAppSelector = false
@@ -199,6 +202,11 @@ fun LimitOutApp() {
                 onSelectAppClick = { showAppSelector = true },
                 onEditLimitClick = { editingPackage = it },
                 onRemoveApp = { saveTargetApps(targetApps - it) },
+                onToggleApp = { pkg, enabled ->
+                    targetApps[pkg]?.let { config ->
+                        saveTargetApps(targetApps + (pkg to config.copy(enabled = enabled)))
+                    }
+                },
                 snoozeTime = snoozeTime,
                 onSnoozeTimeChange = {
                     snoozeTime = it
@@ -217,10 +225,11 @@ fun MainSettingsScreen(
     isShowNotification: Boolean,
     onNotificationChange: (Boolean) -> Unit,
     selectedApps: List<AppInfo>,
-    targetApps: Map<String, Int>,
+    targetApps: Map<String, TargetAppConfig>,
     onSelectAppClick: () -> Unit,
     onEditLimitClick: (String) -> Unit,
     onRemoveApp: (String) -> Unit,
+    onToggleApp: (String, Boolean) -> Unit,
     snoozeTime: String,
     onSnoozeTimeChange: (String) -> Unit
 ) {
@@ -288,12 +297,14 @@ fun MainSettingsScreen(
                             )
                         } else {
                             selectedApps.forEach { app ->
+                                val config = targetApps[app.packageName]
+                                    ?: TargetAppConfig(TargetAppsStore.DEFAULT_LIMIT_MINUTES)
                                 TargetAppRow(
                                     app = app,
-                                    limitMinutes = targetApps[app.packageName]
-                                        ?: TargetAppsStore.DEFAULT_LIMIT_MINUTES,
+                                    config = config,
                                     onEditLimitClick = { onEditLimitClick(app.packageName) },
-                                    onRemoveClick = { onRemoveApp(app.packageName) }
+                                    onRemoveClick = { onRemoveApp(app.packageName) },
+                                    onToggleEnabled = { onToggleApp(app.packageName, it) }
                                 )
                             }
                         }
@@ -336,34 +347,44 @@ fun MainSettingsScreen(
 @Composable
 fun TargetAppRow(
     app: AppInfo,
-    limitMinutes: Int,
+    config: TargetAppConfig,
     onEditLimitClick: () -> Unit,
-    onRemoveClick: () -> Unit
+    onRemoveClick: () -> Unit,
+    onToggleEnabled: (Boolean) -> Unit
 ) {
+    val contentAlpha = if (config.enabled) 1f else 0.4f
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onEditLimitClick)
-            .padding(vertical = 8.dp),
+            .padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        Switch(
+            checked = config.enabled,
+            onCheckedChange = onToggleEnabled,
+            colors = SwitchDefaults.colors(checkedTrackColor = LimitOutPrimary)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
         if (app.icon != null) {
             Image(
                 painter = rememberDrawablePainter(drawable = app.icon),
                 contentDescription = null,
-                modifier = Modifier.size(40.dp)
+                modifier = Modifier.size(40.dp).alpha(contentAlpha)
             )
             Spacer(modifier = Modifier.width(12.dp))
         }
         Text(
             text = app.appName,
             style = MaterialTheme.typography.titleSmall,
-            modifier = Modifier.weight(1f)
+            modifier = Modifier.weight(1f).alpha(contentAlpha)
         )
         Text(
-            text = "$limitMinutes 分",
+            text = "${config.limitMinutes} 分",
             style = MaterialTheme.typography.labelLarge,
-            color = LimitOutPrimary
+            color = LimitOutPrimary,
+            modifier = Modifier.alpha(contentAlpha)
         )
         IconButton(onClick = onRemoveClick) {
             Icon(

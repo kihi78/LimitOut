@@ -28,8 +28,11 @@ class LimitOutAccessibilityService : AccessibilityService() {
     private lateinit var sharedPrefs: SharedPreferences
     private var snoozeEndTimeMillis: Long = 0
 
-    /** 制限対象アプリ（パッケージ名 → 制限時間[分]）。設定変更のたびに読み直す。 */
-    private var targetApps: Map<String, Int> = emptyMap()
+    /** 有効な制限対象アプリ（パッケージ名 → 制限時間[分]）。オフにしたアプリは含まない。 */
+    private var activeTargets: Map<String, Int> = emptyMap()
+
+    /** 通知表示用に、無効化されたアプリも含めた対象アプリ数を保持する。 */
+    private var targetAppCount: Int = 0
 
     /** 現在計測中のアプリ。別の対象アプリへ移ったらタイマーを引き継がず計測し直す。 */
     private var timerPackage: String? = null
@@ -80,9 +83,9 @@ class LimitOutAccessibilityService : AccessibilityService() {
                 if (!isEnabled) cancelLimitTimer()
             }
             TargetAppsStore.KEY_TARGET_APPS -> {
-                targetApps = TargetAppsStore.load(prefs)
+                reloadTargetApps(prefs)
 
-                // 対象アプリや制限時間の変更を即座に反映させるため、計測をやり直す
+                // 対象アプリ・制限時間・有効/無効の変更を即座に反映させるため、計測をやり直す
                 cancelLimitTimer()
                 if (isServiceEnabled()) {
                     if (prefs.getBoolean("show_notification", true)) showNotification()
@@ -110,13 +113,19 @@ class LimitOutAccessibilityService : AccessibilityService() {
         return false
     }
 
+    private fun reloadTargetApps(prefs: SharedPreferences) {
+        val allTargets = TargetAppsStore.load(prefs)
+        targetAppCount = allTargets.size
+        activeTargets = allTargets.filterValues { it.enabled }.mapValues { it.value.limitMinutes }
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d("LimitOutService", "LimitOutの監視サービスが接続されました！")
 
         sharedPrefs = getSharedPreferences("limitout_prefs", Context.MODE_PRIVATE)
         sharedPrefs.registerOnSharedPreferenceChangeListener(prefListener)
-        targetApps = TargetAppsStore.load(sharedPrefs)
+        reloadTargetApps(sharedPrefs)
 
         val filter = IntentFilter().apply {
             addAction("ACTION_LIMITOUT_SNOOZE")
@@ -134,7 +143,7 @@ class LimitOutAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (!isServiceEnabled()) return
 
-        val targets = targetApps
+        val targets = activeTargets
         if (targets.isEmpty()) return
 
         if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
@@ -154,7 +163,7 @@ class LimitOutAccessibilityService : AccessibilityService() {
     }
 
     private fun checkCurrentScreenAndHandleTimer() {
-        val targets = targetApps
+        val targets = activeTargets
         if (targets.isEmpty()) {
             cancelLimitTimer()
             return
@@ -189,7 +198,7 @@ class LimitOutAccessibilityService : AccessibilityService() {
 
             if (System.currentTimeMillis() < snoozeEndTimeMillis) return@launch
 
-            if (resolveActivePackage(targetApps.keys) == targetPackage) {
+            if (resolveActivePackage(activeTargets.keys) == targetPackage) {
                 Log.d("LimitOutService", "制限時間に到達したため、ホーム画面へ強制遷移させます")
                 forceGoHome()
             }
@@ -238,9 +247,8 @@ class LimitOutAccessibilityService : AccessibilityService() {
             this, 1, dismissIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val targetCount = targetApps.size
-        val contentText = if (targetCount > 0) {
-            "${targetCount}個のアプリの連続使用を監視しています"
+        val contentText = if (targetAppCount > 0) {
+            "${activeTargets.size}/${targetAppCount}個のアプリの連続使用を監視しています"
         } else {
             "制限対象のアプリが選択されていません"
         }
