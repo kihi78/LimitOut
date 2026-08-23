@@ -9,14 +9,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
-import android.os.Build
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
-import com.github.kihi78.limitout.R
 
 class LimitOutAccessibilityService : AccessibilityService() {
 
@@ -29,6 +27,12 @@ class LimitOutAccessibilityService : AccessibilityService() {
 
     private lateinit var sharedPrefs: SharedPreferences
     private var snoozeEndTimeMillis: Long = 0
+
+    /** 制限対象アプリ（パッケージ名 → 制限時間[分]）。設定変更のたびに読み直す。 */
+    private var targetApps: Map<String, Int> = emptyMap()
+
+    /** 現在計測中のアプリ。別の対象アプリへ移ったらタイマーを引き継がず計測し直す。 */
+    private var timerPackage: String? = null
 
     private val actionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -75,6 +79,16 @@ class LimitOutAccessibilityService : AccessibilityService() {
 
                 if (!isEnabled) cancelLimitTimer()
             }
+            TargetAppsStore.KEY_TARGET_APPS -> {
+                targetApps = TargetAppsStore.load(prefs)
+
+                // 対象アプリや制限時間の変更を即座に反映させるため、計測をやり直す
+                cancelLimitTimer()
+                if (isServiceEnabled()) {
+                    if (prefs.getBoolean("show_notification", true)) showNotification()
+                    checkCurrentScreenAndHandleTimer()
+                }
+            }
         }
     }
 
@@ -84,10 +98,15 @@ class LimitOutAccessibilityService : AccessibilityService() {
         "android"
     )
 
-    private fun isIgnoredPackage(pkg: String, target: String): Boolean {
+    /** 制限対象に選ばれていない限り、画面遷移のノイズとして無視するブラウザ。 */
+    private val conditionallyIgnoredBrowsers = listOf(
+        "com.android.chrome",
+        "com.sec.android.app.sbrowser"
+    )
+
+    private fun isIgnoredPackage(pkg: String, targets: Set<String>): Boolean {
         if (baseIgnoredPackages.contains(pkg)) return true
-        if (target != "com.android.chrome" && pkg == "com.android.chrome") return true
-        if (target != "com.sec.android.app.sbrowser" && pkg == "com.sec.android.app.sbrowser") return true
+        if (conditionallyIgnoredBrowsers.contains(pkg) && !targets.contains(pkg)) return true
         return false
     }
 
@@ -97,6 +116,7 @@ class LimitOutAccessibilityService : AccessibilityService() {
 
         sharedPrefs = getSharedPreferences("limitout_prefs", Context.MODE_PRIVATE)
         sharedPrefs.registerOnSharedPreferenceChangeListener(prefListener)
+        targetApps = TargetAppsStore.load(sharedPrefs)
 
         val filter = IntentFilter().apply {
             addAction("ACTION_LIMITOUT_SNOOZE")
@@ -109,24 +129,18 @@ class LimitOutAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun getTargetAppPackage(): String = sharedPrefs.getString("target_package", "") ?: ""
     private fun isServiceEnabled(): Boolean = sharedPrefs.getBoolean("is_enabled", false)
-
-    private fun getLimitTimeMillis(): Long {
-        val minutes = sharedPrefs.getInt("limit_time", 5)
-        return minutes * 60 * 1000L
-    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (!isServiceEnabled()) return
 
-        val currentTarget = getTargetAppPackage()
-        if (currentTarget.isEmpty()) return
+        val targets = targetApps
+        if (targets.isEmpty()) return
 
         if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             val packageName = event.packageName?.toString() ?: return
 
-            if (isIgnoredPackage(packageName, currentTarget)) return
+            if (isIgnoredPackage(packageName, targets.keys)) return
             if (packageName == lastPackageName) return
 
             lastPackageName = packageName
@@ -140,42 +154,42 @@ class LimitOutAccessibilityService : AccessibilityService() {
     }
 
     private fun checkCurrentScreenAndHandleTimer() {
-        val currentTarget = getTargetAppPackage()
-        if (currentTarget.isEmpty()) return
-
-        var activePackage = rootInActiveWindow?.packageName?.toString() ?: lastPackageName
-        if (isIgnoredPackage(activePackage, currentTarget)) {
-            activePackage = lastPackageName
+        val targets = targetApps
+        if (targets.isEmpty()) {
+            cancelLimitTimer()
+            return
         }
 
-        if (activePackage == currentTarget) {
-            if (System.currentTimeMillis() >= snoozeEndTimeMillis) {
-                startLimitTimer()
-            } else {
-                cancelLimitTimer()
-            }
+        val activePackage = resolveActivePackage(targets.keys)
+        val limitMinutes = targets[activePackage]
+
+        if (limitMinutes != null && System.currentTimeMillis() >= snoozeEndTimeMillis) {
+            startLimitTimer(activePackage, limitMinutes)
         } else {
             cancelLimitTimer()
         }
     }
 
-    private fun startLimitTimer() {
-        if (timerJob?.isActive == true) return
+    /** 現在表示中のアプリを返す。無視対象の画面が挟まった場合は直前のアプリとみなす。 */
+    private fun resolveActivePackage(targets: Set<String>): String {
+        val activePackage = rootInActiveWindow?.packageName?.toString() ?: lastPackageName
+        return if (isIgnoredPackage(activePackage, targets)) lastPackageName else activePackage
+    }
+
+    private fun startLimitTimer(targetPackage: String, limitMinutes: Int) {
+        // 同じアプリを計測中ならそのまま継続する
+        if (timerJob?.isActive == true && timerPackage == targetPackage) return
+
+        cancelLimitTimer()
+        timerPackage = targetPackage
 
         timerJob = serviceScope.launch {
-            val currentLimitMillis = getLimitTimeMillis()
-            Log.d("LimitOutService", "タイマースタート: ターゲット[${getTargetAppPackage()}]")
-            delay(currentLimitMillis)
+            Log.d("LimitOutService", "タイマースタート: ターゲット[$targetPackage] ${limitMinutes}分")
+            delay(limitMinutes * 60 * 1000L)
 
             if (System.currentTimeMillis() < snoozeEndTimeMillis) return@launch
 
-            val currentTarget = getTargetAppPackage()
-            var activePackage = rootInActiveWindow?.packageName?.toString() ?: lastPackageName
-            if (isIgnoredPackage(activePackage, currentTarget)) {
-                activePackage = lastPackageName
-            }
-
-            if (activePackage == currentTarget) {
+            if (resolveActivePackage(targetApps.keys) == targetPackage) {
                 Log.d("LimitOutService", "制限時間に到達したため、ホーム画面へ強制遷移させます")
                 forceGoHome()
             }
@@ -185,9 +199,10 @@ class LimitOutAccessibilityService : AccessibilityService() {
     private fun cancelLimitTimer() {
         if (timerJob?.isActive == true) {
             timerJob?.cancel()
-            timerJob = null
             Log.d("LimitOutService", "タイマーをリセットしました")
         }
+        timerJob = null
+        timerPackage = null
     }
 
     private fun forceGoHome() {
@@ -198,6 +213,7 @@ class LimitOutAccessibilityService : AccessibilityService() {
         startActivity(homeIntent)
         lastPackageName = ""
         timerJob = null
+        timerPackage = null
     }
 
     private fun showNotification() {
@@ -222,9 +238,16 @@ class LimitOutAccessibilityService : AccessibilityService() {
             this, 1, dismissIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val targetCount = targetApps.size
+        val contentText = if (targetCount > 0) {
+            "${targetCount}個のアプリの連続使用を監視しています"
+        } else {
+            "制限対象のアプリが選択されていません"
+        }
+
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("LimitOut 監視中")
-            .setContentText("設定されたアプリの連続使用を監視しています")
+            .setContentText(contentText)
             .setSmallIcon(com.github.kihi78.limitout.R.drawable.ic_notification)
             .setOngoing(true)
             .addAction(android.R.drawable.ic_media_pause, "${snoozeMinutes}分間停止", snoozePendingIntent)

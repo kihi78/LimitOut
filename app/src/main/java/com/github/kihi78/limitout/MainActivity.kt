@@ -43,6 +43,9 @@ val LimitOutPrimaryVariant = Color(0xFF95B4D1)
 val LimitOutBackground = Color(0xFFF5F7FA)
 val LimitOutCardBg = Color(0xFFFFFFFF)
 
+/** 制限時間として選べる分数。 */
+val limitOptions = listOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 25, 30, 40, 50, 60)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,6 +62,17 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun resolveAppInfo(packageManager: PackageManager, packageName: String): AppInfo = try {
+    val appInfo = packageManager.getApplicationInfo(packageName, 0)
+    AppInfo(
+        appName = packageManager.getApplicationLabel(appInfo).toString(),
+        packageName = packageName,
+        icon = packageManager.getApplicationIcon(appInfo)
+    )
+} catch (e: PackageManager.NameNotFoundException) {
+    AppInfo(appName = "アプリが見つかりません", packageName = packageName, icon = null)
+}
+
 @Composable
 fun LimitOutApp() {
     val context = LocalContext.current
@@ -73,15 +87,21 @@ fun LimitOutApp() {
     var isEnabled by remember { mutableStateOf(sharedPrefs.getBoolean("is_enabled", false)) }
     var isShowNotification by remember { mutableStateOf(sharedPrefs.getBoolean("show_notification", true)) }
 
-    var targetPackageName by remember { mutableStateOf(sharedPrefs.getString("target_package", "") ?: "") }
-    var targetAppName by remember { mutableStateOf("未選択") }
-    var targetAppIcon by remember { mutableStateOf<Drawable?>(null) }
+    // 制限対象アプリ（パッケージ名 → 制限時間[分]）
+    var targetApps by remember { mutableStateOf(TargetAppsStore.load(sharedPrefs)) }
+    var selectedApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
 
-    var limitTime by remember { mutableStateOf(sharedPrefs.getInt("limit_time", 5)) }
+    var defaultLimitTime by remember { mutableStateOf(TargetAppsStore.defaultLimitMinutes(sharedPrefs)) }
     var snoozeTime by remember { mutableStateOf(sharedPrefs.getString("snooze_time", "10") ?: "10") }
 
     var showAppSelector by remember { mutableStateOf(false) }
     var installedApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
+    var editingPackage by remember { mutableStateOf<String?>(null) }
+
+    val saveTargetApps: (Map<String, Int>) -> Unit = { updated ->
+        targetApps = updated
+        TargetAppsStore.save(sharedPrefs, updated)
+    }
 
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -99,33 +119,45 @@ fun LimitOutApp() {
                     packageName = it.activityInfo.packageName,
                     icon = it.loadIcon(packageManager)
                 )
-            }.sortedBy { it.appName.lowercase() }
+            }
+                // 同じパッケージがランチャーActivityの数だけ重複するため取り除く
+                .distinctBy { it.packageName }
+                .sortedBy { it.appName.lowercase() }
             installedApps = apps
         }
     }
 
-    LaunchedEffect(targetPackageName) {
-        if (targetPackageName.isNotEmpty()) {
-            try {
-                val appInfo = packageManager.getApplicationInfo(targetPackageName, 0)
-                targetAppName = packageManager.getApplicationLabel(appInfo).toString()
-                targetAppIcon = packageManager.getApplicationIcon(appInfo)
-            } catch (e: PackageManager.NameNotFoundException) {
-                targetAppName = "アプリが見つかりません"
-                targetAppIcon = null
-            }
+    // 選択中のアプリ名とアイコンを解決する（対象アプリが増減したときだけ実行）
+    LaunchedEffect(targetApps.keys) {
+        val packages = targetApps.keys.toList()
+        selectedApps = withContext(Dispatchers.IO) {
+            packages.map { resolveAppInfo(packageManager, it) }.sortedBy { it.appName.lowercase() }
         }
+    }
+
+    editingPackage?.let { packageName ->
+        val appName = selectedApps.find { it.packageName == packageName }?.appName ?: packageName
+        LimitTimeDialog(
+            appName = appName,
+            currentMinutes = targetApps[packageName] ?: TargetAppsStore.DEFAULT_LIMIT_MINUTES,
+            onConfirm = { minutes ->
+                saveTargetApps(targetApps + (packageName to minutes))
+                editingPackage = null
+            },
+            onDismiss = { editingPackage = null }
+        )
     }
 
     if (showAppSelector) {
         AppSelectionScreen(
             apps = installedApps,
-            onAppSelected = { selected ->
-                targetPackageName = selected.packageName
-                targetAppName = selected.appName
-                targetAppIcon = selected.icon
-                sharedPrefs.edit().putString("target_package", selected.packageName).apply()
-                showAppSelector = false
+            selectedPackages = targetApps.keys,
+            onAppToggled = { app, checked ->
+                if (checked) {
+                    saveTargetApps(targetApps + (app.packageName to defaultLimitTime))
+                } else {
+                    saveTargetApps(targetApps - app.packageName)
+                }
             },
             onBack = { showAppSelector = false }
         )
@@ -141,12 +173,14 @@ fun LimitOutApp() {
                 isShowNotification = it
                 sharedPrefs.edit().putBoolean("show_notification", it).apply()
             },
-            targetAppName = targetAppName,
-            targetAppIcon = targetAppIcon,
+            selectedApps = selectedApps,
+            targetApps = targetApps,
             onSelectAppClick = { showAppSelector = true },
-            limitTime = limitTime,
-            onLimitTimeChange = {
-                limitTime = it
+            onEditLimitClick = { editingPackage = it },
+            onRemoveApp = { saveTargetApps(targetApps - it) },
+            defaultLimitTime = defaultLimitTime,
+            onDefaultLimitTimeChange = {
+                defaultLimitTime = it
                 sharedPrefs.edit().putInt("limit_time", it).apply()
             },
             snoozeTime = snoozeTime,
@@ -165,16 +199,16 @@ fun MainSettingsScreen(
     onEnabledChange: (Boolean) -> Unit,
     isShowNotification: Boolean,
     onNotificationChange: (Boolean) -> Unit,
-    targetAppName: String,
-    targetAppIcon: Drawable?,
+    selectedApps: List<AppInfo>,
+    targetApps: Map<String, Int>,
     onSelectAppClick: () -> Unit,
-    limitTime: Int,
-    onLimitTimeChange: (Int) -> Unit,
+    onEditLimitClick: (String) -> Unit,
+    onRemoveApp: (String) -> Unit,
+    defaultLimitTime: Int,
+    onDefaultLimitTimeChange: (Int) -> Unit,
     snoozeTime: String,
     onSnoozeTimeChange: (String) -> Unit
 ) {
-    val limitOptions = listOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 25, 30, 40, 50, 60)
-
     Scaffold(
         containerColor = LimitOutBackground,
         topBar = {
@@ -227,29 +261,32 @@ fun MainSettingsScreen(
                 }
             }
 
-            // カード2: ターゲットアプリ
+            // カード2: ターゲットアプリ（複数選択・アプリごとの制限時間）
             item {
                 SettingCard(title = "制限対象", icon = Icons.Default.Smartphone) {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        onClick = onSelectAppClick,
-                        colors = CardDefaults.cardColors(containerColor = LimitOutBackground),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(16.dp).fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            if (targetAppIcon != null) {
-                                Image(
-                                    painter = rememberDrawablePainter(drawable = targetAppIcon),
-                                    contentDescription = null,
-                                    modifier = Modifier.size(40.dp)
-                                )
-                                Spacer(modifier = Modifier.width(16.dp))
-                            }
-                            Text(text = targetAppName, style = MaterialTheme.typography.titleMedium, color = LimitOutPrimary)
+                    if (selectedApps.isEmpty()) {
+                        Text(
+                            "制限するアプリが選択されていません",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        selectedApps.forEach { app ->
+                            TargetAppRow(
+                                app = app,
+                                limitMinutes = targetApps[app.packageName]
+                                    ?: TargetAppsStore.DEFAULT_LIMIT_MINUTES,
+                                onEditLimitClick = { onEditLimitClick(app.packageName) },
+                                onRemoveClick = { onRemoveApp(app.packageName) }
+                            )
                         }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TextButton(onClick = onSelectAppClick) {
+                        Icon(Icons.Default.Add, contentDescription = null, tint = LimitOutPrimary)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("アプリを追加・変更", color = LimitOutPrimary)
                     }
                 }
             }
@@ -257,26 +294,21 @@ fun MainSettingsScreen(
             // カード3: タイマー設定
             item {
                 SettingCard(title = "時間設定", icon = Icons.Default.Timer) {
-                    Text("連続使用の制限時間", style = MaterialTheme.typography.labelLarge, color = LimitOutPrimary)
+                    Text(
+                        "デフォルトの制限時間",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = LimitOutPrimary
+                    )
+                    Text(
+                        "アプリを新しく追加したときに適用されます",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    AndroidView(
-                        factory = { ctx ->
-                            android.widget.NumberPicker(ctx).apply {
-                                minValue = 0
-                                maxValue = limitOptions.size - 1
-                                displayedValues = limitOptions.map { "$it 分" }.toTypedArray()
-                                wrapSelectorWheel = true
-                                value = limitOptions.indexOf(limitTime).takeIf { it >= 0 } ?: 0
-                                setOnValueChangedListener { _, _, newVal ->
-                                    onLimitTimeChange(limitOptions[newVal])
-                                }
-                            }
-                        },
-                        update = { picker ->
-                            picker.value = limitOptions.indexOf(limitTime).takeIf { it >= 0 } ?: 0
-                        },
-                        modifier = Modifier.fillMaxWidth().height(120.dp)
+                    MinutePicker(
+                        selectedMinutes = defaultLimitTime,
+                        onMinutesChange = onDefaultLimitTimeChange
                     )
 
                     Spacer(modifier = Modifier.height(24.dp))
@@ -301,6 +333,102 @@ fun MainSettingsScreen(
             item { Spacer(modifier = Modifier.height(32.dp)) }
         }
     }
+}
+
+@Composable
+fun TargetAppRow(
+    app: AppInfo,
+    limitMinutes: Int,
+    onEditLimitClick: () -> Unit,
+    onRemoveClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onEditLimitClick)
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (app.icon != null) {
+            Image(
+                painter = rememberDrawablePainter(drawable = app.icon),
+                contentDescription = null,
+                modifier = Modifier.size(40.dp)
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+        }
+        Text(
+            text = app.appName,
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            text = "$limitMinutes 分",
+            style = MaterialTheme.typography.labelLarge,
+            color = LimitOutPrimary
+        )
+        IconButton(onClick = onRemoveClick) {
+            Icon(
+                Icons.Default.Close,
+                contentDescription = "${app.appName} を制限対象から外す",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+/** 制限時間を分単位で選ぶピッカー。 */
+@Composable
+fun MinutePicker(
+    selectedMinutes: Int,
+    onMinutesChange: (Int) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    AndroidView(
+        factory = { ctx ->
+            android.widget.NumberPicker(ctx).apply {
+                minValue = 0
+                maxValue = limitOptions.size - 1
+                displayedValues = limitOptions.map { "$it 分" }.toTypedArray()
+                wrapSelectorWheel = true
+                value = limitOptions.indexOf(selectedMinutes).takeIf { it >= 0 } ?: 0
+                setOnValueChangedListener { _, _, newVal ->
+                    onMinutesChange(limitOptions[newVal])
+                }
+            }
+        },
+        update = { picker ->
+            picker.value = limitOptions.indexOf(selectedMinutes).takeIf { it >= 0 } ?: 0
+        },
+        modifier = modifier.fillMaxWidth().height(120.dp)
+    )
+}
+
+@Composable
+fun LimitTimeDialog(
+    appName: String,
+    currentMinutes: Int,
+    onConfirm: (Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var selectedMinutes by remember(currentMinutes) { mutableStateOf(currentMinutes) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("$appName の制限時間") },
+        text = {
+            MinutePicker(
+                selectedMinutes = selectedMinutes,
+                onMinutesChange = { selectedMinutes = it }
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(selectedMinutes) }) { Text("決定") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("キャンセル") }
+        }
+    )
 }
 
 // 共通で使うデザインカード
@@ -331,13 +459,14 @@ fun SettingCard(
 @Composable
 fun AppSelectionScreen(
     apps: List<AppInfo>,
-    onAppSelected: (AppInfo) -> Unit,
+    selectedPackages: Set<String>,
+    onAppToggled: (AppInfo, Boolean) -> Unit,
     onBack: () -> Unit
 ) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("アプリを選択") },
+                title = { Text("アプリを選択 (${selectedPackages.size})") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "戻る")
@@ -352,14 +481,21 @@ fun AppSelectionScreen(
             }
         } else {
             LazyColumn(modifier = Modifier.padding(padding).fillMaxSize()) {
-                items(apps) { app ->
+                items(apps, key = { it.packageName }) { app ->
+                    val isSelected = selectedPackages.contains(app.packageName)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onAppSelected(app) }
-                            .padding(16.dp),
+                            .clickable { onAppToggled(app, !isSelected) }
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        Checkbox(
+                            checked = isSelected,
+                            onCheckedChange = { onAppToggled(app, it) },
+                            colors = CheckboxDefaults.colors(checkedColor = LimitOutPrimary)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
                         Image(
                             painter = rememberDrawablePainter(drawable = app.icon),
                             contentDescription = null,
