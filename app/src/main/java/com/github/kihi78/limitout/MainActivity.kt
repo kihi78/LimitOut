@@ -1,7 +1,6 @@
 package com.github.kihi78.limitout
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
@@ -28,6 +27,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.material3.CardDefaults
@@ -44,6 +44,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.google.accompanist.drawablepainter.rememberDrawablePainter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -86,7 +88,7 @@ private fun resolveAppInfo(packageManager: PackageManager, packageName: String):
 @Composable
 fun LimitOutApp() {
     val context = LocalContext.current
-    val sharedPrefs = remember { context.getSharedPreferences("limitout_prefs", Context.MODE_PRIVATE) }
+    val sharedPrefs = remember { MonitorSettings.prefs(context) }
     val packageManager = context.packageManager
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -94,14 +96,31 @@ fun LimitOutApp() {
         onResult = {}
     )
 
-    var isEnabled by remember { mutableStateOf(sharedPrefs.getBoolean("is_enabled", false)) }
-    var isShowNotification by remember { mutableStateOf(sharedPrefs.getBoolean("show_notification", true)) }
+    var isEnabled by remember { mutableStateOf(MonitorSettings.isEnabled(sharedPrefs)) }
+    var isShowNotification by remember { mutableStateOf(MonitorSettings.showNotification(sharedPrefs)) }
+    var useAccessibility by remember { mutableStateOf(MonitorSettings.useAccessibility(sharedPrefs)) }
+
+    // システム設定で付与する権限は、設定画面から戻ってきたタイミングで見直す
+    var permissionTick by remember { mutableIntStateOf(0) }
+    DisposableEffect(context) {
+        val lifecycle = (context as? ComponentActivity)?.lifecycle
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) permissionTick++
+        }
+        lifecycle?.addObserver(observer)
+        onDispose { lifecycle?.removeObserver(observer) }
+    }
+    val isAccessibilityGranted = remember(permissionTick) {
+        MonitorPermissions.isAccessibilityServiceEnabled(context)
+    }
+    val isUsageStatsGranted = remember(permissionTick) { MonitorPermissions.hasUsageStats(context) }
+    val isOverlayGranted = remember(permissionTick) { MonitorPermissions.hasOverlay(context) }
 
     // 制限対象アプリ（パッケージ名 → 制限時間[分]・有効/無効）
     var targetApps by remember { mutableStateOf(TargetAppsStore.load(sharedPrefs)) }
     var selectedApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
 
-    var snoozeTime by remember { mutableStateOf(sharedPrefs.getString("snooze_time", "10") ?: "10") }
+    var snoozeTime by remember { mutableStateOf(MonitorSettings.snoozeMinutesText(sharedPrefs)) }
 
     var showAppSelector by remember { mutableStateOf(false) }
     var installedApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
@@ -110,6 +129,12 @@ fun LimitOutApp() {
     val saveTargetApps: (Map<String, TargetAppConfig>) -> Unit = { updated ->
         targetApps = updated
         TargetAppsStore.save(sharedPrefs, updated)
+    }
+
+    // 軽量モードは常駐しないので、設定や権限が変わるたびに監視サイクルを張り直す。
+    // AccessibilityService方式が選ばれている間、sync() はアラームを止めるだけで何もしない。
+    LaunchedEffect(isEnabled, isShowNotification, useAccessibility, snoozeTime, targetApps, permissionTick) {
+        LightweightMonitor.sync(context)
     }
 
     LaunchedEffect(Unit) {
@@ -190,12 +215,36 @@ fun LimitOutApp() {
                 isEnabled = isEnabled,
                 onEnabledChange = {
                     isEnabled = it
-                    sharedPrefs.edit().putBoolean("is_enabled", it).apply()
+                    // 切り替え時に、前回のスヌーズが残ったまま監視が始まらないようにする
+                    sharedPrefs.edit()
+                        .putBoolean(MonitorSettings.KEY_IS_ENABLED, it)
+                        .putLong(MonitorSettings.KEY_SNOOZE_END_MILLIS, 0L)
+                        .apply()
                 },
                 isShowNotification = isShowNotification,
                 onNotificationChange = {
                     isShowNotification = it
-                    sharedPrefs.edit().putBoolean("show_notification", it).apply()
+                    sharedPrefs.edit().putBoolean(MonitorSettings.KEY_SHOW_NOTIFICATION, it).apply()
+                },
+                useAccessibility = useAccessibility,
+                onUseAccessibilityChange = {
+                    useAccessibility = it
+                    sharedPrefs.edit()
+                        .putBoolean(MonitorSettings.KEY_USE_ACCESSIBILITY, it)
+                        .putLong(MonitorSettings.KEY_SNOOZE_END_MILLIS, 0L)
+                        .apply()
+                },
+                isAccessibilityGranted = isAccessibilityGranted,
+                isUsageStatsGranted = isUsageStatsGranted,
+                isOverlayGranted = isOverlayGranted,
+                onOpenAccessibilitySettings = {
+                    context.startActivity(MonitorPermissions.accessibilitySettingsIntent())
+                },
+                onOpenUsageStatsSettings = {
+                    context.startActivity(MonitorPermissions.usageStatsSettingsIntent())
+                },
+                onOpenOverlaySettings = {
+                    context.startActivity(MonitorPermissions.overlaySettingsIntent(context))
                 },
                 selectedApps = selectedApps,
                 targetApps = targetApps,
@@ -210,7 +259,7 @@ fun LimitOutApp() {
                 snoozeTime = snoozeTime,
                 onSnoozeTimeChange = {
                     snoozeTime = it
-                    sharedPrefs.edit().putString("snooze_time", it).apply()
+                    sharedPrefs.edit().putString(MonitorSettings.KEY_SNOOZE_TIME, it).apply()
                 }
             )
         }
@@ -224,6 +273,14 @@ fun MainSettingsScreen(
     onEnabledChange: (Boolean) -> Unit,
     isShowNotification: Boolean,
     onNotificationChange: (Boolean) -> Unit,
+    useAccessibility: Boolean,
+    onUseAccessibilityChange: (Boolean) -> Unit,
+    isAccessibilityGranted: Boolean,
+    isUsageStatsGranted: Boolean,
+    isOverlayGranted: Boolean,
+    onOpenAccessibilitySettings: () -> Unit,
+    onOpenUsageStatsSettings: () -> Unit,
+    onOpenOverlaySettings: () -> Unit,
     selectedApps: List<AppInfo>,
     targetApps: Map<String, TargetAppConfig>,
     onSelectAppClick: () -> Unit,
@@ -257,30 +314,54 @@ fun MainSettingsScreen(
             // カード1: システム設定
             item {
                 SettingCard(title = "稼働設定", icon = Icons.Default.Security) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("制限機能の有効化", style = MaterialTheme.typography.bodyLarge)
-                        Switch(
-                            checked = isEnabled,
-                            onCheckedChange = onEnabledChange,
-                            colors = SwitchDefaults.colors(checkedTrackColor = LimitOutPrimary)
-                        )
-                    }
+                    SettingSwitchRow(
+                        title = "制限機能の有効化",
+                        checked = isEnabled,
+                        onCheckedChange = onEnabledChange
+                    )
                     Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("通知を表示（常駐）", style = MaterialTheme.typography.bodyLarge)
-                        Switch(
-                            checked = isShowNotification,
-                            onCheckedChange = onNotificationChange,
-                            colors = SwitchDefaults.colors(checkedTrackColor = LimitOutPrimary)
-                        )
+                    SettingSwitchRow(
+                        title = "通知を表示（常駐）",
+                        checked = isShowNotification,
+                        onCheckedChange = onNotificationChange
+                    )
+
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+
+                    SettingSwitchRow(
+                        title = "AccessibilityServiceを使用",
+                        description = if (useAccessibility) {
+                            "画面の切り替わりをリアルタイムに検知します。確実ですが、ユーザー補助の許可が必要です。"
+                        } else {
+                            "軽量モードで動作します。ユーザー補助は不要ですが、検知は定期チェックのタイミングになります。"
+                        },
+                        checked = useAccessibility,
+                        onCheckedChange = onUseAccessibilityChange
+                    )
+
+                    Column(modifier = Modifier.animateContentSize()) {
+                        if (useAccessibility) {
+                            PermissionRow(
+                                title = "ユーザー補助でLimitOutを有効化",
+                                granted = isAccessibilityGranted,
+                                required = true,
+                                onClick = onOpenAccessibilitySettings
+                            )
+                        } else {
+                            PermissionRow(
+                                title = "使用状況へのアクセス",
+                                granted = isUsageStatsGranted,
+                                required = true,
+                                onClick = onOpenUsageStatsSettings
+                            )
+                            PermissionRow(
+                                title = "他のアプリの上に重ねて表示",
+                                description = "許可しない場合、ホーム画面へ戻さず通知でお知らせします。",
+                                granted = isOverlayGranted,
+                                required = false,
+                                onClick = onOpenOverlaySettings
+                            )
+                        }
                     }
                 }
             }
@@ -341,6 +422,92 @@ fun MainSettingsScreen(
 
             item { Spacer(modifier = Modifier.height(32.dp)) }
         }
+    }
+}
+
+/** 「タイトル（＋補足）」と右端のスイッチ、という稼働設定の共通レイアウト。 */
+@Composable
+fun SettingSwitchRow(
+    title: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    description: String? = null
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            if (description != null) {
+                Text(
+                    text = description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(checkedTrackColor = LimitOutPrimary)
+        )
+    }
+}
+
+/**
+ * システム設定でしか付与できない権限の状態と、その設定画面への導線。
+ *
+ * @param required 必須権限か。false の場合、未許可でも動作はするので警告色にしない。
+ */
+@Composable
+fun PermissionRow(
+    title: String,
+    granted: Boolean,
+    required: Boolean,
+    onClick: () -> Unit,
+    description: String? = null
+) {
+    val statusColor = when {
+        granted -> LimitOutPrimary
+        required -> MaterialTheme.colorScheme.error
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = if (granted) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
+            contentDescription = null,
+            tint = statusColor
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                text = if (granted) "許可済み" else if (required) "未許可（タップして設定）" else "未許可・任意（タップして設定）",
+                style = MaterialTheme.typography.bodySmall,
+                color = statusColor
+            )
+            if (description != null) {
+                Text(
+                    text = description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        Icon(
+            Icons.AutoMirrored.Filled.OpenInNew,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 

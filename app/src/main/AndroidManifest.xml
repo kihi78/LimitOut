@@ -9,6 +9,18 @@
         </intent>
     </queries>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 以下は AccessibilityService を使わない軽量モード用 -->
+    <!-- 前面アプリと連続起動時間の取得（ユーザーが設定画面で許可する） -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+    <!-- バックグラウンドからホーム画面へ遷移させるために必要 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 逆算したタイミングで正確に起床するため -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- 端末再起動後に監視サイクルを張り直すため -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -40,6 +52,16 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
         </service>
+
+        <!-- 軽量モードの入口。アラームでの起床・通知操作・端末起動をここで受ける。 -->
+        <receiver
+            android:name=".MonitorAlarmReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

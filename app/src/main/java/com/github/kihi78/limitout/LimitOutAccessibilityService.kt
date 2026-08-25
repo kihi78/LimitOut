@@ -1,9 +1,6 @@
 package com.github.kihi78.limitout
 
 import android.accessibilityservice.AccessibilityService
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -12,7 +9,6 @@ import android.content.SharedPreferences
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.widget.Toast
-import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 
@@ -40,8 +36,8 @@ class LimitOutAccessibilityService : AccessibilityService() {
     private val actionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
-                "ACTION_LIMITOUT_SNOOZE" -> {
-                    val snoozeMinutes = sharedPrefs.getString("snooze_time", "10")?.toLongOrNull() ?: 10L
+                ACTION_SNOOZE -> {
+                    val snoozeMinutes = MonitorSettings.snoozeMinutes(sharedPrefs)
                     snoozeEndTimeMillis = System.currentTimeMillis() + (snoozeMinutes * 60 * 1000L)
                     cancelLimitTimer()
 
@@ -56,10 +52,8 @@ class LimitOutAccessibilityService : AccessibilityService() {
                         checkCurrentScreenAndHandleTimer()
                     }
                 }
-                "ACTION_LIMITOUT_NOTIF_DISMISSED" -> {
-                    val isEnabled = sharedPrefs.getBoolean("is_enabled", false)
-                    val showNotif = sharedPrefs.getBoolean("show_notification", true)
-                    if (isEnabled && showNotif) {
+                ACTION_NOTIF_DISMISSED -> {
+                    if (isServiceEnabled() && MonitorSettings.showNotification(sharedPrefs)) {
                         Log.d("LimitOutService", "通知が消されましたが、設定がONのため復活させます")
                         showNotification()
                     }
@@ -70,17 +64,19 @@ class LimitOutAccessibilityService : AccessibilityService() {
 
     private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
         when (key) {
-            "is_enabled", "show_notification", "snooze_time" -> {
-                val isEnabled = prefs.getBoolean("is_enabled", false)
-                val showNotif = prefs.getBoolean("show_notification", true)
+            MonitorSettings.KEY_IS_ENABLED,
+            MonitorSettings.KEY_SHOW_NOTIFICATION,
+            MonitorSettings.KEY_SNOOZE_TIME,
+            MonitorSettings.KEY_USE_ACCESSIBILITY -> {
+                val isActive = isServiceEnabled()
 
-                if (isEnabled && showNotif) {
+                if (isActive && MonitorSettings.showNotification(prefs)) {
                     showNotification()
                 } else {
                     hideNotification()
                 }
 
-                if (!isEnabled) cancelLimitTimer()
+                if (!isActive) cancelLimitTimer()
             }
             TargetAppsStore.KEY_TARGET_APPS -> {
                 reloadTargetApps(prefs)
@@ -88,7 +84,7 @@ class LimitOutAccessibilityService : AccessibilityService() {
                 // 対象アプリ・制限時間・有効/無効の変更を即座に反映させるため、計測をやり直す
                 cancelLimitTimer()
                 if (isServiceEnabled()) {
-                    if (prefs.getBoolean("show_notification", true)) showNotification()
+                    if (MonitorSettings.showNotification(prefs)) showNotification()
                     checkCurrentScreenAndHandleTimer()
                 }
             }
@@ -123,22 +119,27 @@ class LimitOutAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         Log.d("LimitOutService", "LimitOutの監視サービスが接続されました！")
 
-        sharedPrefs = getSharedPreferences("limitout_prefs", Context.MODE_PRIVATE)
+        sharedPrefs = MonitorSettings.prefs(this)
         sharedPrefs.registerOnSharedPreferenceChangeListener(prefListener)
         reloadTargetApps(sharedPrefs)
 
         val filter = IntentFilter().apply {
-            addAction("ACTION_LIMITOUT_SNOOZE")
-            addAction("ACTION_LIMITOUT_NOTIF_DISMISSED")
+            addAction(ACTION_SNOOZE)
+            addAction(ACTION_NOTIF_DISMISSED)
         }
         ContextCompat.registerReceiver(this, actionReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
-        if (sharedPrefs.getBoolean("is_enabled", false) && sharedPrefs.getBoolean("show_notification", true)) {
+        if (isServiceEnabled() && MonitorSettings.showNotification(sharedPrefs)) {
             showNotification()
         }
     }
 
-    private fun isServiceEnabled(): Boolean = sharedPrefs.getBoolean("is_enabled", false)
+    /**
+     * 制限機能がONで、かつ監視方式としてAccessibilityServiceが選ばれているか。
+     * 軽量モードが選ばれている間、このサービスは何もしない。
+     */
+    private fun isServiceEnabled(): Boolean =
+        MonitorSettings.isEnabled(sharedPrefs) && MonitorSettings.useAccessibility(sharedPrefs)
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (!isServiceEnabled()) return
@@ -226,48 +227,19 @@ class LimitOutAccessibilityService : AccessibilityService() {
     }
 
     private fun showNotification() {
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val channelId = "limitout_status_channel"
-
-        val channel = NotificationChannel(
-            channelId,
-            "LimitOut 動作状態",
-            NotificationManager.IMPORTANCE_LOW
+        MonitorNotifications.showStatus(
+            context = this,
+            activeCount = activeTargets.size,
+            totalCount = targetAppCount,
+            snoozeMinutes = MonitorSettings.snoozeMinutesText(sharedPrefs),
+            modeLabel = MODE_LABEL,
+            snoozeIntent = Intent(ACTION_SNOOZE).apply { setPackage(packageName) },
+            dismissIntent = Intent(ACTION_NOTIF_DISMISSED).apply { setPackage(packageName) }
         )
-        notificationManager.createNotificationChannel(channel)
-
-        val snoozeMinutes = sharedPrefs.getString("snooze_time", "10") ?: "10"
-        val snoozeIntent = Intent("ACTION_LIMITOUT_SNOOZE").apply { setPackage(packageName) }
-        val snoozePendingIntent = PendingIntent.getBroadcast(
-            this, 0, snoozeIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val dismissIntent = Intent("ACTION_LIMITOUT_NOTIF_DISMISSED").apply { setPackage(packageName) }
-        val dismissPendingIntent = PendingIntent.getBroadcast(
-            this, 1, dismissIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val contentText = if (targetAppCount > 0) {
-            "${activeTargets.size}/${targetAppCount}個のアプリの連続使用を監視しています"
-        } else {
-            "制限対象のアプリが選択されていません"
-        }
-
-        val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("LimitOut 監視中")
-            .setContentText(contentText)
-            .setSmallIcon(com.github.kihi78.limitout.R.drawable.ic_notification)
-            .setOngoing(true)
-            .addAction(android.R.drawable.ic_media_pause, "${snoozeMinutes}分間停止", snoozePendingIntent)
-            .setDeleteIntent(dismissPendingIntent)
-            .build()
-
-        notificationManager.notify(1, notification)
     }
 
     private fun hideNotification() {
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.cancel(1)
+        MonitorNotifications.hideStatus(this)
     }
 
     override fun onDestroy() {
@@ -281,4 +253,12 @@ class LimitOutAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {}
+
+    private companion object {
+        /** 軽量モード側と取り違えないよう、このサービス専用のアクション名を使う。 */
+        const val ACTION_SNOOZE = "ACTION_LIMITOUT_SNOOZE"
+        const val ACTION_NOTIF_DISMISSED = "ACTION_LIMITOUT_NOTIF_DISMISSED"
+
+        const val MODE_LABEL = "リアルタイム"
+    }
 }
