@@ -18,6 +18,8 @@ class MonitorAlarmReceiver : BroadcastReceiver() {
 
             LightweightMonitor.ACTION_SNOOZE -> LightweightMonitor.snooze(context)
 
+            LightweightMonitor.ACTION_RESET -> LightweightMonitor.reset(context)
+
             LightweightMonitor.ACTION_NOTIF_DISMISSED ->
                 LightweightMonitor.restoreNotificationIfNeeded(context)
 

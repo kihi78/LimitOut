@@ -21,8 +21,17 @@ class LimitOutAccessibilityService : AccessibilityService() {
 
     private var snoozeWakeUpJob: Job? = null
 
+    /** 通知の残り時間をリアルタイム更新するためのループ。 */
+    private var countdownJob: Job? = null
+
+    /** 直近で通知に出した残り時間の文言。変化した時だけ通知を再発行するための比較用。 */
+    private var lastCountdownText: String? = null
+
     private lateinit var sharedPrefs: SharedPreferences
     private var snoozeEndTimeMillis: Long = 0
+
+    /** 稼働中の制限時間タイマーが満了する予定時刻（ミリ秒）。残り時間表示の計算に使う。 */
+    private var timerEndTimeMillis: Long = 0
 
     /** 有効な制限対象アプリ（パッケージ名 → 制限時間[分]）。オフにしたアプリは含まない。 */
     private var activeTargets: Map<String, Int> = emptyMap()
@@ -30,7 +39,7 @@ class LimitOutAccessibilityService : AccessibilityService() {
     /** 通知表示用に、無効化されたアプリも含めた対象アプリ数を保持する。 */
     private var targetAppCount: Int = 0
 
-    /** 現在計測中のアプリ。別の対象アプリへ移ったらタイマーを引き継がず計測し直す。 */
+    /** 現在計測中のアプリ。一瞬でも別のアプリへ移ったらタイマーを引き継がず計測し直す。 */
     private var timerPackage: String? = null
 
     private val actionReceiver = object : BroadcastReceiver() {
@@ -57,6 +66,14 @@ class LimitOutAccessibilityService : AccessibilityService() {
                         Log.d("LimitOutService", "通知が消されましたが、設定がONのため復活させます")
                         showNotification()
                     }
+                }
+                ACTION_RESET -> {
+                    Log.d("LimitOutService", "リセットが要求されました。スヌーズとタイマーを破棄して計測をやり直します")
+                    snoozeWakeUpJob?.cancel()
+                    snoozeEndTimeMillis = 0L
+                    cancelLimitTimer()
+                    Toast.makeText(context, "監視をリセットしました", Toast.LENGTH_SHORT).show()
+                    checkCurrentScreenAndHandleTimer()
                 }
             }
         }
@@ -91,22 +108,62 @@ class LimitOutAccessibilityService : AccessibilityService() {
         }
     }
 
-    private val baseIgnoredPackages = listOf(
-        "com.android.systemui",
-        "com.google.android.inputmethod.latin",
-        "android"
-    )
-
     /** 制限対象に選ばれていない限り、画面遷移のノイズとして無視するブラウザ。 */
     private val conditionallyIgnoredBrowsers = listOf(
         "com.android.chrome",
         "com.sec.android.app.sbrowser"
     )
 
+    /** [isLaunchableApp] の判定結果。画面遷移のたびに PackageManager へ問い合わせないよう覚えておく。 */
+    private val launchableCache = mutableMapOf<String, Boolean>()
+
+    /** キャッシュされたデフォルトホームアプリのパッケージ名。 */
+    private var cachedHomePackage: String? = null
+
+    /**
+     * ホーム画面のアプリ一覧に並ぶ「普通のアプリ」かどうか。
+     *
+     * 通知パネル・ステータスバー・IME・システムダイアログなどはランチャーから起動できないため、
+     * ここで false になる。これらのパッケージ名は端末（メーカー・OSバージョン）ごとに異なり
+     * 列挙しきれないので、名前を並べる代わりにこの性質で判定する。
+     */
+    private fun isLaunchableApp(pkg: String): Boolean = launchableCache.getOrPut(pkg) {
+        runCatching { packageManager.getLaunchIntentForPackage(pkg) != null }.getOrDefault(false)
+    }
+
+    /**
+     * デフォルトホーム画面のパッケージ名を返す。端末やユーザー設定によって異なり、
+     * 列挙不可のため `ACTION_MAIN` + `CATEGORY_HOME` で動的に特定する。
+     */
+    private fun getDefaultHomePackage(): String? {
+        if (cachedHomePackage != null) return cachedHomePackage
+
+        val homeIntent = Intent(Intent.ACTION_MAIN).apply { addCategory(Intent.CATEGORY_HOME) }
+        val homePackage = runCatching {
+            packageManager.resolveActivity(homeIntent, 0)?.activityInfo?.packageName
+        }.getOrNull()
+
+        cachedHomePackage = homePackage
+        return homePackage
+    }
+
+    /**
+     * 「ユーザーが別のアプリへ移った」とは見なさない画面かどうか。
+     *
+     * 通知パネル・ステータスバー・IMEなどランチャーから起動できない画面だけを例外とする。
+     * ホーム画面や他の実アプリへ移動したら、対象アプリからは離れたものとしてタイマーをリセットする。
+     */
     private fun isIgnoredPackage(pkg: String, targets: Set<String>): Boolean {
-        if (baseIgnoredPackages.contains(pkg)) return true
-        if (conditionallyIgnoredBrowsers.contains(pkg) && !targets.contains(pkg)) return true
-        return false
+        // 制限対象そのものは常に評価する
+        if (targets.contains(pkg)) return false
+
+        if (conditionallyIgnoredBrowsers.contains(pkg)) return true
+
+        // ホーム画面は実アプリなので、移動時にカウントをリセットする
+        if (pkg == getDefaultHomePackage()) return false
+
+        // 通知パネルを引き下げただけでタイマーがやり直しになるのを防ぐ
+        return !isLaunchableApp(pkg)
     }
 
     private fun reloadTargetApps(prefs: SharedPreferences) {
@@ -126,12 +183,15 @@ class LimitOutAccessibilityService : AccessibilityService() {
         val filter = IntentFilter().apply {
             addAction(ACTION_SNOOZE)
             addAction(ACTION_NOTIF_DISMISSED)
+            addAction(ACTION_RESET)
         }
         ContextCompat.registerReceiver(this, actionReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
         if (isServiceEnabled() && MonitorSettings.showNotification(sharedPrefs)) {
             showNotification()
         }
+
+        startCountdownLoop()
     }
 
     /**
@@ -192,6 +252,7 @@ class LimitOutAccessibilityService : AccessibilityService() {
 
         cancelLimitTimer()
         timerPackage = targetPackage
+        timerEndTimeMillis = System.currentTimeMillis() + limitMinutes * 60 * 1000L
 
         timerJob = serviceScope.launch {
             Log.d("LimitOutService", "タイマースタート: ターゲット[$targetPackage] ${limitMinutes}分")
@@ -213,6 +274,7 @@ class LimitOutAccessibilityService : AccessibilityService() {
         }
         timerJob = null
         timerPackage = null
+        timerEndTimeMillis = 0
     }
 
     private fun forceGoHome() {
@@ -224,17 +286,78 @@ class LimitOutAccessibilityService : AccessibilityService() {
         lastPackageName = ""
         timerJob = null
         timerPackage = null
+        timerEndTimeMillis = 0
+    }
+
+    /**
+     * スヌーズ中は残りのスヌーズ時間、タイマー作動中は残りの制限時間をミリ秒で返す。
+     * どちらでもない場合はnull（＝残り時間表示なし）。
+     */
+    private fun remainingMillisOrNull(): Long? {
+        val now = System.currentTimeMillis()
+        return when {
+            now < snoozeEndTimeMillis -> snoozeEndTimeMillis - now
+            timerJob?.isActive == true -> (timerEndTimeMillis - now).coerceAtLeast(0)
+            else -> null
+        }
+    }
+
+    /** 1分以上なら「M分S秒」、1分未満なら「S秒」で残り時間を表示する。 */
+    private fun formatRemaining(remainingMillis: Long): String {
+        val totalSeconds = remainingMillis / 1000
+        return if (totalSeconds >= 60) {
+            "${totalSeconds / 60}分${totalSeconds % 60}秒"
+        } else {
+            "${totalSeconds}秒"
+        }
+    }
+
+    /**
+     * 残り時間を秒単位で更新し続ける。表示が変わった時だけ通知を出し直すので、
+     * 実際に notify() を呼ぶのは毎秒1回まで。低優先度チャンネル＋setOnlyAlertOnce のため
+     * 音やバイブは鳴らず、消費は毎分更新と比べて実用上の差はない。
+     *
+     * AccessibilityServiceが接続されている間だけ動くループなので、このサービスが
+     * 動いていない（＝AccessibilityServiceがオフ）間はリアルタイム表示は行われない。
+     */
+    private fun startCountdownLoop() {
+        countdownJob?.cancel()
+        countdownJob = serviceScope.launch {
+            while (isActive) {
+                val remainingMillis = remainingMillisOrNull()
+                val text = remainingMillis?.let { formatRemaining(it) }
+
+                if (text != lastCountdownText) {
+                    lastCountdownText = text
+                    if (isServiceEnabled() && MonitorSettings.showNotification(sharedPrefs)) {
+                        showNotification()
+                    }
+                }
+
+                delay(nextTickDelayMillis(remainingMillis))
+            }
+        }
+    }
+
+    /**
+     * 次に表示が変わる「秒の変わり目」までの待ち時間。
+     * 一定間隔で回すとズレが溜まって1秒飛ばしたり二重更新したりするため、毎回計算し直す。
+     */
+    private fun nextTickDelayMillis(remainingMillis: Long?): Long {
+        if (remainingMillis == null) return 1000L
+        val untilNextSecond = remainingMillis % 1000L
+        return if (untilNextSecond > 0L) untilNextSecond else 1000L
     }
 
     private fun showNotification() {
         MonitorNotifications.showStatus(
             context = this,
-            activeCount = activeTargets.size,
             totalCount = targetAppCount,
             snoozeMinutes = MonitorSettings.snoozeMinutesText(sharedPrefs),
-            modeLabel = MODE_LABEL,
             snoozeIntent = Intent(ACTION_SNOOZE).apply { setPackage(packageName) },
-            dismissIntent = Intent(ACTION_NOTIF_DISMISSED).apply { setPackage(packageName) }
+            dismissIntent = Intent(ACTION_NOTIF_DISMISSED).apply { setPackage(packageName) },
+            resetIntent = Intent(ACTION_RESET).apply { setPackage(packageName) },
+            remainingText = remainingMillisOrNull()?.let { formatRemaining(it) }
         )
     }
 
@@ -258,7 +381,6 @@ class LimitOutAccessibilityService : AccessibilityService() {
         /** 軽量モード側と取り違えないよう、このサービス専用のアクション名を使う。 */
         const val ACTION_SNOOZE = "ACTION_LIMITOUT_SNOOZE"
         const val ACTION_NOTIF_DISMISSED = "ACTION_LIMITOUT_NOTIF_DISMISSED"
-
-        const val MODE_LABEL = "リアルタイム"
+        const val ACTION_RESET = "ACTION_LIMITOUT_RESET"
     }
 }

@@ -21,22 +21,26 @@ object MonitorNotifications {
 
     private const val REQUEST_SNOOZE = 0
     private const val REQUEST_DISMISS = 1
+    private const val REQUEST_RESET = 2
+    private const val REQUEST_OPEN_APP = 3
 
     /**
      * 常駐の「監視中」通知を表示する。
      *
-     * @param modeLabel どちらの方式で動いているかを示す文言。動作確認しやすいよう通知に出す。
      * @param snoozeIntent 「N分間停止」ボタンで送るブロードキャスト
      * @param dismissIntent 通知がスワイプで消されたときに送るブロードキャスト
+     * @param resetIntent 「リセット」ボタンで送るブロードキャスト
+     * @param remainingText 残り時間の表示文言（例："1分47秒"）。nullなら残り時間は表示しない。
+     *   軽量モードは常時カウントダウンできないため、常に null を渡す。
      */
     fun showStatus(
         context: Context,
-        activeCount: Int,
         totalCount: Int,
         snoozeMinutes: String,
-        modeLabel: String,
         snoozeIntent: Intent,
-        dismissIntent: Intent
+        dismissIntent: Intent,
+        resetIntent: Intent,
+        remainingText: String? = null
     ) {
         val notificationManager =
             context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -54,22 +58,44 @@ object MonitorNotifications {
             PendingIntent.getBroadcast(context, REQUEST_SNOOZE, snoozeIntent, flags)
         val dismissPendingIntent =
             PendingIntent.getBroadcast(context, REQUEST_DISMISS, dismissIntent, flags)
+        val resetPendingIntent =
+            PendingIntent.getBroadcast(context, REQUEST_RESET, resetIntent, flags)
 
-        val contentText = if (totalCount > 0) {
-            "${activeCount}/${totalCount}個のアプリの連続使用を監視しています"
-        } else {
-            "制限対象のアプリが選択されていません"
+        // 通知本体をタップしたら LimitOut を開く
+        val openAppPendingIntent = PendingIntent.getActivity(
+            context,
+            REQUEST_OPEN_APP,
+            Intent(context, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            flags
+        )
+
+        // タイトルは常に固定文言にする。残り時間を混ぜて長くすると、縦向きなど通知欄の幅が
+        // 狭いときに末尾（＝肝心の残り時間）が省略記号で切り捨てられてしまうため。
+        // 残り時間は短い文言として contentText 側だけに出す。
+        val contentText = when {
+            totalCount == 0 -> "制限対象のアプリが選択されていません"
+            remainingText != null -> "残り$remainingText"
+            else -> null
         }
 
         val notification = NotificationCompat.Builder(context, CHANNEL_ID_STATUS)
-            .setContentTitle("LimitOut 監視中（$modeLabel）")
+            .setContentTitle("LimitOut 監視中")
             .setContentText(contentText)
             .setSmallIcon(R.drawable.ic_notification)
             .setOngoing(true)
+            // 残り時間を毎秒書き換えても、その都度アラート（音・バイブ）が鳴り直さないようにする
+            .setOnlyAlertOnce(true)
+            .setContentIntent(openAppPendingIntent)
             .addAction(
                 android.R.drawable.ic_media_pause,
                 "${snoozeMinutes}分間停止",
                 snoozePendingIntent
+            )
+            .addAction(
+                android.R.drawable.ic_menu_revert,
+                "リセット",
+                resetPendingIntent
             )
             .setDeleteIntent(dismissPendingIntent)
             .build()

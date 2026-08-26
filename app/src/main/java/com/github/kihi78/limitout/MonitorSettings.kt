@@ -22,6 +22,12 @@ object MonitorSettings {
     /** 軽量版でスヌーズ終了時刻をプロセス再生成後も保つための保存先。 */
     const val KEY_SNOOZE_END_MILLIS = "snooze_end_millis"
 
+    /**
+     * 軽量版で「リセット」が押された時刻。常駐していない軽量版はタイマーを持たないため、
+     * この時刻以前の連続使用は数えないことでリセットを表現する。
+     */
+    const val KEY_RESET_AT_MILLIS = "reset_at_millis"
+
     /** 既存ユーザーの挙動を変えないため、AccessibilityService方式を既定とする。 */
     const val DEFAULT_USE_ACCESSIBILITY = true
 
@@ -50,5 +56,12 @@ object MonitorSettings {
 
     fun setSnoozeEndMillis(prefs: SharedPreferences, endMillis: Long) {
         prefs.edit().putLong(KEY_SNOOZE_END_MILLIS, endMillis).apply()
+    }
+
+    fun resetAtMillis(prefs: SharedPreferences): Long =
+        prefs.getLong(KEY_RESET_AT_MILLIS, 0L)
+
+    fun setResetAtMillis(prefs: SharedPreferences, atMillis: Long) {
+        prefs.edit().putLong(KEY_RESET_AT_MILLIS, atMillis).apply()
     }
 }

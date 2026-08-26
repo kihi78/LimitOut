@@ -23,6 +23,7 @@ object LightweightMonitor {
 
     const val ACTION_CHECK = "com.github.kihi78.limitout.action.LW_CHECK"
     const val ACTION_SNOOZE = "com.github.kihi78.limitout.action.LW_SNOOZE"
+    const val ACTION_RESET = "com.github.kihi78.limitout.action.LW_RESET"
     const val ACTION_NOTIF_DISMISSED = "com.github.kihi78.limitout.action.LW_NOTIF_DISMISSED"
 
     private const val REQUEST_CHECK = 100
@@ -32,8 +33,6 @@ object LightweightMonitor {
 
     /** スヌーズ明けの再チェックが早すぎて空振りしないための猶予。 */
     private const val SNOOZE_WAKE_MARGIN_MILLIS = 200L
-
-    private const val MODE_LABEL = "軽量モード"
 
     // ---------------------------------------------------------------- 外部API
 
@@ -88,7 +87,7 @@ object LightweightMonitor {
             .filterValues { it.enabled }
             .mapValues { (_, config) -> config.limitMinutes * 60L }
 
-        updateStatusNotification(appContext, prefs, limitSecondsByPackage.size, allTargets.size)
+        updateStatusNotification(appContext, prefs, allTargets.size)
 
         if (limitSecondsByPackage.isEmpty()) {
             Log.d(TAG, "有効な制限対象がないためチェックを停止します")
@@ -107,7 +106,11 @@ object LightweightMonitor {
         }
 
         val lookBackMillis = limitSecondsByPackage.values.max() * 1000L + LOOK_BACK_MARGIN_MILLIS
-        val state = ForegroundAppTracker(appContext).currentState(lookBackMillis, now)
+        val state = applyResetBaseline(
+            ForegroundAppTracker(appContext).currentState(lookBackMillis, now),
+            MonitorSettings.resetAtMillis(prefs),
+            now
+        )
 
         when (val result = LimitCheckScheduler.decide(state, limitSecondsByPackage)) {
             is CheckResult.Idle -> {
@@ -146,6 +149,25 @@ object LightweightMonitor {
         scheduleAt(appContext, endMillis + SNOOZE_WAKE_MARGIN_MILLIS)
     }
 
+    /**
+     * 通知の「リセット」ボタンから呼ばれる。
+     *
+     * 常駐しない軽量版はタイマーを持たず、UsageStats から遡って連続使用時間を求めている。
+     * そのため「リセット時刻より前の使用は数えない」という基準時刻を置くことで、
+     * 押した瞬間から制限時間をまるごと数え直す（例: 制限5分なら次の検知は5分後）挙動にする。
+     */
+    fun reset(context: Context) {
+        val appContext = context.applicationContext
+        val prefs = MonitorSettings.prefs(appContext)
+
+        MonitorSettings.setSnoozeEndMillis(prefs, 0L)
+        MonitorSettings.setResetAtMillis(prefs, System.currentTimeMillis())
+        Log.d(TAG, "リセット: スヌーズを解除し、ここから制限時間を数え直します")
+
+        // 新しい基準で次のチェック時刻を引き直す
+        runCheck(appContext)
+    }
+
     /** 通知がスワイプで消されたとき、設定がONなら復活させる。 */
     fun restoreNotificationIfNeeded(context: Context) {
         val appContext = context.applicationContext
@@ -153,12 +175,29 @@ object LightweightMonitor {
         if (MonitorSettings.useAccessibility(prefs) || !MonitorSettings.isEnabled(prefs)) return
         if (!MonitorSettings.showNotification(prefs)) return
 
-        val allTargets = TargetAppsStore.load(prefs)
-        val activeCount = allTargets.count { it.value.enabled }
-        updateStatusNotification(appContext, prefs, activeCount, allTargets.size)
+        updateStatusNotification(appContext, prefs, TargetAppsStore.load(prefs).size)
     }
 
     // -------------------------------------------------------------- 内部処理
+
+    /**
+     * リセット時刻より前から続いている使用分を切り捨てる。
+     * リセット直後は連続0秒として扱われるので、制限時間ぶんまるごと待ち直すことになる。
+     */
+    private fun applyResetBaseline(
+        state: ForegroundState,
+        resetAtMillis: Long,
+        now: Long
+    ): ForegroundState {
+        if (resetAtMillis <= 0L || state.packageName == null) return state
+
+        val secondsSinceReset = ((now - resetAtMillis) / 1000L).coerceAtLeast(0L)
+        return if (state.continuousSeconds <= secondsSinceReset) {
+            state
+        } else {
+            state.copy(continuousSeconds = secondsSinceReset)
+        }
+    }
 
     private fun fire(context: Context, result: CheckResult.Fire) {
         val label = resolveAppLabel(context, result.packageName)
@@ -190,7 +229,6 @@ object LightweightMonitor {
     private fun updateStatusNotification(
         context: Context,
         prefs: SharedPreferences,
-        activeCount: Int,
         totalCount: Int
     ) {
         if (!MonitorSettings.showNotification(prefs)) {
@@ -198,14 +236,14 @@ object LightweightMonitor {
             return
         }
 
+        // 軽量版は常駐しないため残り時間のリアルタイム表示はできない（remainingText は渡さない）
         MonitorNotifications.showStatus(
             context = context,
-            activeCount = activeCount,
             totalCount = totalCount,
             snoozeMinutes = MonitorSettings.snoozeMinutesText(prefs),
-            modeLabel = MODE_LABEL,
             snoozeIntent = receiverIntent(context, ACTION_SNOOZE),
-            dismissIntent = receiverIntent(context, ACTION_NOTIF_DISMISSED)
+            dismissIntent = receiverIntent(context, ACTION_NOTIF_DISMISSED),
+            resetIntent = receiverIntent(context, ACTION_RESET)
         )
     }
 
